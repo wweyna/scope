@@ -168,12 +168,14 @@ uint16_t* scope_adc_dma_buffer_right_end;
 uint8_t scope_out_frame_buffer_1[SCOPE_OUT_MAX_DMA_BUFFER_SIZE];
 uint8_t scope_out_frame_buffer_2[SCOPE_OUT_MAX_DMA_BUFFER_SIZE];
 
+uint8_t scope_out_encoded_frame_buffer[SCOPE_OUT_MAX_DMA_BUFFER_SIZE];
+uint16_t scope_out_encoded_frame_buffer_size = 0;
+
 uint8_t* scope_out_frame_front_buffer = scope_out_frame_buffer_1;
 uint8_t* scope_out_frame_back_buffer = scope_out_frame_buffer_2;
 
 uint16_t scope_out_frame_data_size;     // frame size without header
 uint16_t scope_out_frame_buffer_size;   // frame full size
-
 
 enum RunState scope_run_state = kRunState_Invalid;
 
@@ -670,6 +672,62 @@ HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
     scope_out_data_tx_status = kOutDataTxStatus_Completed;
 }
 
+void scope_encode_output_frame()
+{
+    // Set output encoded frame header
+    memcpy (scope_out_encoded_frame_buffer, scope_out_frame_front_buffer, SCOPE_OUT_FRAME_HEADER_SIZE);
+
+    // Encode / pack output frame to make it 20% smaller.
+    // Each 5 12bit samples are packed/encoded into 4 samples by encoding 5th 12 bit sample
+    // into free 3-bit space in 4 12bit samples (12,12,12,12,12 - > 12 + 3, 12 + 3, 12 + 3, 12 + 3).
+    // The encoded 4 sample pack contains data in first 15 bits.
+    // Last byte is reserved for special codes (like frame start).
+
+    const uint16_t src_pack_size_samples = 5;
+    const uint16_t dest_pack_size_samples = src_pack_size_samples - 1;
+    const uint16_t src_pack_size = src_pack_size_samples * SCOPE_ADC_SAMPLE_SIZE;
+    const uint16_t dest_pack_size = dest_pack_size_samples * SCOPE_ADC_SAMPLE_SIZE;
+    const uint16_t pack_count = scope_out_frame_data_size / src_pack_size;
+    const uint16_t tail_data_size = scope_out_frame_data_size % src_pack_size;
+
+    // The data that will be encoded
+    const uint16_t src_encoded_data_size = pack_count * src_pack_size_samples;
+    assert(src_encoded_data_size * SCOPE_ADC_SAMPLE_SIZE  + tail_data_size == scope_out_frame_data_size);
+
+    // The encoded (packed) data.
+    const uint16_t dest_encoded_data_size = pack_count * dest_pack_size_samples;
+    scope_out_encoded_frame_buffer_size = SCOPE_OUT_FRAME_HEADER_SIZE + dest_encoded_data_size * SCOPE_ADC_SAMPLE_SIZE + tail_data_size;
+
+    // Source range to be encoded
+    const uint16_t* src_begin = scope_out_frame_front_buffer + SCOPE_OUT_FRAME_HEADER_SIZE;
+    const uint16_t* src_end = src_begin + src_encoded_data_size;
+
+    // Destination range
+    uint16_t* dest = scope_out_encoded_frame_buffer + SCOPE_OUT_FRAME_HEADER_SIZE;
+    uint16_t* dest_end = dest + dest_encoded_data_size;
+
+    // Encode
+    for (uint16_t* src = src_begin; src < src_end; src++)
+    {
+        const uint16_t* src_last_sample = (uint16_t*)(src + dest_pack_size_samples);
+        const uint16_t last_sample = *src_last_sample;
+        // 3 bits from last sample are added at bit 12 - bit 14 positions 0b0xxxnnnnnnnnn
+        // bit 15 is reserved for special codes like start of frame (0xFFFE)
+        *dest++ = *src++ | ((last_sample & 0b0000000000000111) << 12);
+        *dest++ = *src++ | ((last_sample & 0b0000000000111000) << 9);
+        *dest++ = *src++ | ((last_sample & 0b0000000111000000) << 6);
+        *dest++ = *src++ | ((last_sample & 0b0000111000000000) << 3);
+    }
+
+    assert (dest == dest_end);
+
+    // The tail data are not encoded, just copy it
+    if (tail_data_size > 0)
+    {
+        memcpy (dest_end, src_end, tail_data_size);
+    }
+}
+
 
 // -------------------- Scope external API ----------------
 
@@ -744,7 +802,13 @@ void Scope_TransmitFrame()
 
     uint32_t tickstart = HAL_GetTick();
 
-    HAL_StatusTypeDef status = HAL_UART_Transmit_DMA(&hlpuart1, scope_out_frame_front_buffer, scope_out_frame_buffer_size);
+    // Pack (scope_out_frame_front_buffer, scope_out_frame_buffer_size)
+    // to (scope_out_encoded_frame_buffer, scope_out_encoded_frame_buffer_size)
+    // Packed output frame is 20% smaller.
+    scope_encode_output_frame();
+
+    HAL_StatusTypeDef status = HAL_UART_Transmit_DMA(&hlpuart1, scope_out_encoded_frame_buffer, scope_out_encoded_frame_buffer_size);
+
     UNUSED(status);
 
     // Wait for the UART DMA to finish the frame transmission (wait for HAL_UART_TxCpltCallback())
