@@ -700,13 +700,16 @@ void scope_encode_output_frame()
     // Set output encoded frame header
     memcpy (scope_out_encoded_frame_buffer, scope_out_frame_front_buffer, SCOPE_OUT_FRAME_HEADER_SIZE);
 
-    // Encode / pack output frame to make it 20% smaller.
-    // Each 5 12bit samples are packed/encoded into 4 samples by encoding 5th 12 bit sample
-    // into free 3-bit space in 4 12bit samples (12,12,12,12,12 - > 12 + 3, 12 + 3, 12 + 3, 12 + 3).
+    // Encode / pack output frame to make it smaller.
+
+    // For 10-bit transport sample.
+    // ADC data is reduced to 10 bit sample for transport
+    // The pack of 3 10bit samples is encoded into 2 samples by encoding 3rd sample into free 5-bit space of first 2 samples
+    // (12,12,12) -> (10,10,10) -> (10 + 5, 10 + 5)
     // The encoded 4 sample pack contains data in first 15 bits.
     // Last byte is reserved for special codes (like frame start).
 
-    const uint16_t src_pack_size_samples = 5;
+    const uint16_t src_pack_size_samples = 3;
     const uint16_t dest_pack_size_samples = src_pack_size_samples - 1;
     const uint16_t src_pack_size = src_pack_size_samples * SCOPE_ADC_SAMPLE_SIZE;
     const uint16_t dest_pack_size = dest_pack_size_samples * SCOPE_ADC_SAMPLE_SIZE;
@@ -733,21 +736,19 @@ void scope_encode_output_frame()
     for (uint16_t* src = src_begin; src < src_end; src++)
     {
         const uint16_t* src_last_sample = (uint16_t*)(src + dest_pack_size_samples);
-        const uint16_t last_sample = *src_last_sample;
-        // 3 bits from last sample are added at bit 12 - bit 14 positions 0b0xxxnnnnnnnnn
-        // bit 15 is reserved for special codes like start of frame (0xFFFE)
-        *dest++ = *src++ | ((last_sample & 0b0000000000000111) << 12);
-        *dest++ = *src++ | ((last_sample & 0b0000000000111000) << 9);
-        *dest++ = *src++ | ((last_sample & 0b0000000111000000) << 6);
-        *dest++ = *src++ | ((last_sample & 0b0000111000000000) << 3);
+        const uint16_t last_sample_10bit = (*src_last_sample) >> 2;
+        // 5 bits from last sample are added at bit 10-14 0b0xxxxxnnnnnnn
+        // bit 15 is reserved for special codes that use bit 15 like start of frame (0xFFFE)
+        *dest++ = ((*src++) >> 2) | ((last_sample_10bit & 0b0000000000011111) << 10);
+        *dest++ = ((*src++) >> 2) | ((last_sample_10bit & 0b0000001111100000) << 5);
     }
 
     assert (dest == dest_end);
 
-    // The tail data are not encoded, just copy it
-    if (tail_data_size > 0)
+    // Copy tail data (remaining unencoded samples)
+    for (uint16_t* src = src_end; src < src_end + tail_data_size; src++)
     {
-        memcpy (dest_end, src_end, tail_data_size);
+        *dest++ = (*src) >> 2;
     }
 }
 
