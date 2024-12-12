@@ -6,6 +6,10 @@
 # Node artifact files
 node_modules/
 dist/
+Debug/
+.settings/
+
+g474_scope*.launch
 
 # Compiled Java class files
 *.class

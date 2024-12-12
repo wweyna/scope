@@ -14,6 +14,9 @@
 #include <string.h>
 #include <stdbool.h>
 
+#define MAX(x, y) (((x) > (y)) ? (x) : (y))
+#define MIN(x, y) (((x) < (y)) ? (x) : (y))
+
 // ----------- External handles to peripherals  -----------
 
 extern ADC_HandleTypeDef    hadc1;
@@ -31,7 +34,9 @@ extern DMA_HandleTypeDef    hdma_lpuart1_tx;
 #define SCOPE_ADC_MAX_FRAME_SIZE                (1154)
 
 /// Half of ADC buffer can hold maximum of SCOPE_ADC_FRAMES_IN_HALF_BUFFER frames of maximum size
-#define SCOPE_ADC_FRAMES_IN_HALF_BUFFER         (2)
+/// Increasing this number gives more time for processing in ADC interrupt but reduces the output frame rate.
+/// The output frame rate shoudn't go below the maximum frame rate supported by transport / UART.
+#define SCOPE_ADC_FRAMES_IN_HALF_BUFFER         (5)
 
 /// Half of ADC DMA buffer size in unit16_t samples
 #define SCOPE_ADC_MAX_DMA_BUFFER_HALF_SIZE      (SCOPE_ADC_MAX_FRAME_SIZE * SCOPE_ADC_FRAMES_IN_HALF_BUFFER)
@@ -191,7 +196,7 @@ enum OutDataTxStatus scope_out_data_tx_status = kOutDataTxStatus_Idle;
 enum OutputFrameReadyStatus scope_out_frame_ready_status = kOutputFrameReadyStatus_Idle;
 
 
-uint16_t scope_trigger_value = SCOPE_ADC_MAX_VALUE / 2;
+uint16_t scope_default_trigger_value = SCOPE_ADC_MAX_VALUE / 2;
 
 // ------------- local scope functions ---------------
 
@@ -480,6 +485,23 @@ const uint16_t* scope_find_trigger_in_sample()
     {
         assert(false);
     }
+
+
+    // Auto find trigger - use mean signal value as trigger value
+
+    uint16_t min_value = -1;
+    uint16_t max_value = 0;
+
+    for (uint16_t* it = begin; it < end; ++it)
+    {
+        const uint16_t value = *it;
+        min_value = MIN(min_value, value);
+        max_value = MAX(max_value, value);
+    }
+
+    const uint16_t mean_value = (max_value - min_value + 1) >> 1;
+    const uint16_t scope_trigger_value = min_value + mean_value;
+
 
     // Trigger when value change passes thru scope_trigger_value
     uint16_t start_value = *begin;

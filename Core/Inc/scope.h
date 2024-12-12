@@ -22,7 +22,8 @@ enum ScopeTriggerType
     kScopeTrigger_None
 };
 
-/// Time bases supported by scope
+/// Time bases supported by scope.
+/// Value of time is per frame, not per division (time base / div depends on client)
 enum TimeBaseCode
 {
     kTimeBase_Invalid = 0,

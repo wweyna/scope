@@ -46,28 +46,36 @@ uint16_t waveform_samples_DAC1[MAX_WAVEFROM_SAMPLES_DAC1];
 #define MAX_WAVEFROM_SAMPLES_DAC2  200
 uint16_t waveform_samples_DAC2[MAX_WAVEFROM_SAMPLES_DAC2];
 
-void generate_wave(uint16_t* waveform_samples, uint32_t samples_count)
+void generate_wave(uint16_t* waveform_samples, uint32_t samples_count, float offset_from_center, float amplitude)
 {
     const double max_amplitude = 2.0;       // amplitude of sin wave
-    const double amplitude_factor = 0.93;   // this will limit the amplitude
     const double wave_to_dac = MAX_DAC_VALUE / max_amplitude;  // sin() to 16 bit DAC converting factor
+    int center_offset = MAX_DAC_VALUE / 2;
+    int custom_offset = offset_from_center * center_offset;
 
     for (int i = 0; i < samples_count; ++i)
     {
-        const double y = sin(i * 2 * PI / samples_count) * amplitude_factor + 1;
-        const uint16_t dac_value = round(y * wave_to_dac);
+        const double sin_y = sin(i * 2 * PI / samples_count);
+        const double y_signal = round(sin_y * wave_to_dac) * amplitude;
+        uint16_t dac_value = custom_offset + center_offset + y_signal;
+        if (dac_value > MAX_DAC_VALUE)
+        {
+            dac_value = MAX_DAC_VALUE;
+        }
         waveform_samples[i] = dac_value;
     }
 }
 
 void generate_wave_DAC1()
 {
-    generate_wave(waveform_samples_DAC1, MAX_WAVEFROM_SAMPLES_DAC1);
+    //generate_wave(waveform_samples_DAC1, MAX_WAVEFROM_SAMPLES_DAC1, 0.4, 0.56);
+    generate_wave(waveform_samples_DAC1, MAX_WAVEFROM_SAMPLES_DAC1, 0, 0.9);
 }
 
 void generate_wave_DAC2()
 {
-    generate_wave(waveform_samples_DAC2, MAX_WAVEFROM_SAMPLES_DAC2);
+    //generate_wave(waveform_samples_DAC2, MAX_WAVEFROM_SAMPLES_DAC2, -0.65, 0.14);
+    generate_wave(waveform_samples_DAC2, MAX_WAVEFROM_SAMPLES_DAC2, 0, 0.9);
 }
 
 uint32_t timer_prescaler;                   /* Time base prescaler to have timebase aligned on minimum frequency possible */
