@@ -499,8 +499,9 @@ const uint16_t* scope_find_trigger_in_sample()
         max_value = MAX(max_value, value);
     }
 
-    const uint16_t mean_value = (max_value - min_value + 1) >> 1;
-    const uint16_t scope_trigger_value = min_value + mean_value;
+    const uint16_t half_amplitude = (max_value - min_value) >> 1;
+    const uint16_t mean_value = min_value + half_amplitude;
+    const uint16_t scope_trigger_value =  + mean_value;
 
 
     // Trigger when value change passes thru scope_trigger_value
