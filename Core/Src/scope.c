@@ -34,9 +34,8 @@ extern DMA_HandleTypeDef    hdma_lpuart1_tx;
 #define SCOPE_ADC_MAX_FRAME_SIZE                (1154)
 
 /// Half of ADC buffer can hold maximum of SCOPE_ADC_FRAMES_IN_HALF_BUFFER frames of maximum size
-/// Increasing this number gives more time for processing in ADC interrupt but reduces the output frame rate.
-/// The output frame rate shoudn't go below the maximum frame rate supported by transport / UART.
-#define SCOPE_ADC_FRAMES_IN_HALF_BUFFER         (5)
+/// Increasing this number gives more time for processing in ADC interrupt.
+#define SCOPE_ADC_FRAMES_IN_HALF_BUFFER         (2)
 
 /// Half of ADC DMA buffer size in unit16_t samples
 #define SCOPE_ADC_MAX_DMA_BUFFER_HALF_SIZE      (SCOPE_ADC_MAX_FRAME_SIZE * SCOPE_ADC_FRAMES_IN_HALF_BUFFER)
@@ -61,6 +60,11 @@ extern DMA_HandleTypeDef    hdma_lpuart1_tx;
 
 /// Maximum value of ADC conversion for 12 bit adc resolution
 #define SCOPE_ADC_MAX_VALUE __LL_ADC_DIGITAL_SCALE(LL_ADC_RESOLUTION_12B) // 4095
+
+
+#define SCOPE_MARGIN_FRAME_COUNT         1
+#define SCOPE_RECORD_BUFFER_FRAME_COUNT  (SCOPE_ADC_FRAMES_IN_HALF_BUFFER + SCOPE_MARGIN_FRAME_COUNT * 2)
+#define SCOPE_RECORD_BUFFER_MAX_SIZE     (SCOPE_RECORD_BUFFER_FRAME_COUNT * SCOPE_ADC_MAX_FRAME_SIZE)
 
 
 // ----------- Types -----------------
@@ -94,35 +98,24 @@ struct TimeBaseDescriptor scope_time_base_descriptors[] = {
 };
 
 
-/// Indicates the state of ADC acquisition and copying of a single frame of data from the ADC ring-buffer.
-enum FrameAcquisitionStatus
+///
+enum RecordingStatus
 {
     /// ADC sampler is not working
-    kFrameAcquisitionStatus_Idle,
-    /**
-    Data acquisition and frame copy is done, frame is ready to be transmitted.
-    If there is transmission in progress, this frame won't be transmitted, will be skipped.
-    */
-    kFrameAcquisitionStatus_Completed,
-    /// Data acquisition of the left buffer is over and frame is being copied.
-    kFrameAcquisitionStatus_LeftHalf,
-    ///  Data acquisition of the right buffer is over and frame is being copied.
-    kFrameAcquisitionStatus_RightHalf
+    kRecordingStatus_Idle,
+    /// Recording in progress, record buffer is locked
+    kRecordingStatus_InProgress,
+    /// Recording completed, record buffer is unlocked
+    kRecordingStatus_Completed,
 };
 
-/// Indicates to the transmitter whether the output frame is ready to be send or not
-enum OutputFrameReadyStatus
+///
+enum ADCBufferStatus
 {
-    /// ADC sampler is not working
-    kOutputFrameReadyStatus_Idle,
-    /// Waiting for new frame to be available in the frame output buffer.
-    kOutputFrameReadyStatus_Waiting,
-    /**
-    New frame is ready in the frame output buffer.
-    It is set after kFrameAcquisitionStatus_Completed if there is no ongoing transmission.
-    If there is transmission in progress, this frame won't be transmitted, will be skipped.
-    */
-    kOutputFrameReadyStatus_Ready,
+    /// Data acquisition in the left buffer is completed
+    kADCBufferStatus_LeftHalf,
+    /// Data acquisition in the right buffer is completed
+    kADCBufferStatus_RightHalf
 };
 
 /// Output frame transmission status
@@ -148,11 +141,11 @@ enum ScopeCommand
 // ----------- Local data  -----------
 
 enum ScopeCommand scope_requested_command = kCmd_None;
-
 uint16_t scope_adc_vdda_voltage;
-size_t scope_part_out_frame_data_size;
 enum TimeBaseCode scope_requested_new_time_base_code;
 enum TimeBaseCode scope_time_base_code = SCOPE_DEFAULT_TIME_BASE;
+enum RecordingStatus scope_recording_status = kRecordingStatus_Idle;
+uint16_t no_trigger_offset = 0;
 
 // ADC DMA ring-buffer.
 // This buffer records a continues stream of ADC samples in real-time.
@@ -160,13 +153,16 @@ enum TimeBaseCode scope_time_base_code = SCOPE_DEFAULT_TIME_BASE;
 uint16_t scope_adc_dma_buffer[SCOPE_ADC_MAX_DMA_BUFFER_SIZE];
 
 uint16_t scope_adc_frame_size;
+uint16_t scope_adc_frame_size_bytes;
 uint16_t scope_adc_dma_buffer_half_size;
 uint16_t scope_adc_dma_buffer_size;
-
 uint16_t* scope_adc_dma_buffer_left_begin;
-uint16_t* scope_adc_dma_buffer_left_end;
 uint16_t* scope_adc_dma_buffer_right_begin;
-uint16_t* scope_adc_dma_buffer_right_end;
+
+// Record buffer
+
+uint16_t scope_record_buffer[SCOPE_RECORD_BUFFER_MAX_SIZE];
+uint16_t scope_record_counter;
 
 // Output frame double-buffer.
 
@@ -190,10 +186,7 @@ enum ScopeEdgeType scope_requested_edge_type = kScopeEdge_Rising;
 enum ScopeTriggerType scope_trigger_type = kScopeTrigger_Auto;
 enum ScopeTriggerType scope_requested_trigger_type = kScopeTrigger_Auto;
 
-enum FrameAcquisitionStatus scope_adc_frame_status = kFrameAcquisitionStatus_Idle;
-enum FrameAcquisitionStatus scope_adc_frame_status_once = kFrameAcquisitionStatus_Idle;
 enum OutDataTxStatus scope_out_data_tx_status = kOutDataTxStatus_Idle;
-enum OutputFrameReadyStatus scope_out_frame_ready_status = kOutputFrameReadyStatus_Idle;
 
 
 uint16_t scope_default_trigger_value = SCOPE_ADC_MAX_VALUE / 2;
@@ -209,10 +202,8 @@ bool scope_is_time_base_code_valid(enum TimeBaseCode timeBaseCode)
 static
 void scope_reset_status()
 {
-    scope_adc_frame_status = kFrameAcquisitionStatus_Idle;
-    scope_adc_frame_status_once = kFrameAcquisitionStatus_Idle;
-    scope_out_frame_ready_status = kOutputFrameReadyStatus_Idle;
-    scope_part_out_frame_data_size = 0;
+    scope_recording_status = kRecordingStatus_Idle;
+    scope_record_counter = 0;
     scope_requested_command = kCmd_None;
 }
 
@@ -224,17 +215,15 @@ static
 void scope_select_frame_size(int adc_frame_size)
 {
     scope_adc_frame_size = adc_frame_size;
+    scope_adc_frame_size_bytes = scope_adc_frame_size * SCOPE_ADC_SAMPLE_SIZE;
 
     scope_adc_dma_buffer_half_size = scope_adc_frame_size * SCOPE_ADC_FRAMES_IN_HALF_BUFFER;
     scope_adc_dma_buffer_size = scope_adc_dma_buffer_half_size * 2;
 
     scope_adc_dma_buffer_left_begin = scope_adc_dma_buffer;
+    scope_adc_dma_buffer_right_begin = scope_adc_dma_buffer_left_begin + scope_adc_dma_buffer_half_size;
 
-    scope_adc_dma_buffer_left_end = scope_adc_dma_buffer_left_begin + scope_adc_dma_buffer_half_size;
-    scope_adc_dma_buffer_right_begin = scope_adc_dma_buffer_left_end;
-    scope_adc_dma_buffer_right_end = scope_adc_dma_buffer_right_begin + scope_adc_dma_buffer_half_size;
-
-    scope_out_frame_data_size = scope_adc_frame_size * SCOPE_ADC_SAMPLE_SIZE;
+    scope_out_frame_data_size = scope_adc_frame_size_bytes;
     scope_out_frame_buffer_size = scope_out_frame_data_size + SCOPE_OUT_FRAME_HEADER_SIZE;
 }
 
@@ -260,7 +249,11 @@ void scope_setup_frame_header()
 static
 void scope_reset_buffers()
 {
-    memset((char*)scope_adc_dma_buffer, 0, SCOPE_ADC_MAX_DMA_BUFFER_SIZE * 2);
+    assert(SCOPE_ADC_FRAMES_IN_HALF_BUFFER % 2 == 0);
+    assert(SCOPE_RECORD_BUFFER_FRAME_COUNT % SCOPE_ADC_FRAMES_IN_HALF_BUFFER == 0);
+
+    memset((char*)scope_adc_dma_buffer, 0, SCOPE_ADC_MAX_DMA_BUFFER_SIZE * SCOPE_ADC_SAMPLE_SIZE);
+    memset((char*)scope_record_buffer, 0, SCOPE_RECORD_BUFFER_MAX_SIZE * SCOPE_ADC_SAMPLE_SIZE);
     memset((char*)scope_out_frame_buffer_1, 0, SCOPE_OUT_MAX_DMA_BUFFER_SIZE);
     memset((char*)scope_out_frame_buffer_2, 0, SCOPE_OUT_MAX_DMA_BUFFER_SIZE);
     scope_out_frame_front_buffer = scope_out_frame_buffer_1;
@@ -368,124 +361,39 @@ void scope_select_time_base(enum TimeBaseCode timeBaseCode)
 static
 void scope_swap_out_buffers()
 {
-    // This method is called from interrupt and works in synch with frame transmission method.
-
     // Cannot swap output buffer if transmission is in progress.
-    // Output frame will be lost.
-    if (scope_out_data_tx_status != kOutDataTxStatus_InProgress)
-    {
-        // Swap buffers.
-        uint8_t* tmp = scope_out_frame_front_buffer;
-        scope_out_frame_front_buffer = scope_out_frame_back_buffer;
-        scope_out_frame_back_buffer = tmp;
-
-        scope_out_frame_ready_status = kOutputFrameReadyStatus_Ready;
-    }
-
-    assert (scope_out_frame_front_buffer != scope_out_frame_back_buffer);
-
-    // Update acquisition parameters.
-    scope_edge_type = scope_requested_edge_type;
-    scope_trigger_type = scope_requested_trigger_type;
-
-    // Frame acquisition process is now completed.
-    scope_adc_frame_status = kFrameAcquisitionStatus_Completed;
-}
-
-static
-bool scope_copy_frame_to_backbuffer(const uint16_t* adc_frame_begin)
-{
-    uint8_t* const out_buffer_begin = scope_out_frame_back_buffer + SCOPE_OUT_FRAME_HEADER_SIZE;
-
-    if (scope_part_out_frame_data_size > 0)
-    {
-        // Step 2 of output buffer collection process.
-        // Copy remaining adc data to output buffer.
-        const size_t first_part_out_frame_data_size = scope_out_frame_data_size - scope_part_out_frame_data_size;
-
-        assert (adc_frame_begin == scope_adc_dma_buffer_left_begin || adc_frame_begin == scope_adc_dma_buffer_left_end);
-        assert (scope_part_out_frame_data_size + first_part_out_frame_data_size == scope_out_frame_data_size);
-
-        memcpy(out_buffer_begin + first_part_out_frame_data_size, adc_frame_begin, scope_part_out_frame_data_size);
-        scope_part_out_frame_data_size = 0;
-        return true;
-    }
-
-    const uint16_t* const adc_frame_end = adc_frame_begin + scope_adc_frame_size;
-
-    if (adc_frame_begin < scope_adc_dma_buffer_left_end)
-    {
-        if (adc_frame_end <= scope_adc_dma_buffer_left_end)
-        {
-            memcpy(out_buffer_begin, adc_frame_begin, scope_out_frame_data_size);
-            scope_part_out_frame_data_size = 0;
-            return true;
-        }
-        else if (adc_frame_end > scope_adc_dma_buffer_left_end)
-        {
-            // Step 1 of output buffer collection process.
-            // Remaining data will be copied when copy_frame_to_backbuffer() is called in next adc interrupt
-            scope_part_out_frame_data_size = sizeof(uint16_t) * (adc_frame_end - scope_adc_dma_buffer_left_end);
-            assert(scope_out_frame_data_size > scope_part_out_frame_data_size);
-            memcpy(out_buffer_begin, adc_frame_begin, scope_out_frame_data_size - scope_part_out_frame_data_size);
-            return false;
-        }
-    }
-
-    else if (adc_frame_begin >= scope_adc_dma_buffer_left_end)
-    {
-        if (adc_frame_end <= scope_adc_dma_buffer_right_end)
-        {
-            memcpy(out_buffer_begin, adc_frame_begin, scope_out_frame_data_size);
-            scope_part_out_frame_data_size = 0;
-            return true;
-        }
-        else if (adc_frame_end > scope_adc_dma_buffer_right_end)
-        {
-            // Step 1 of output buffer collection process.
-            // Remaining data will be copied when copy_frame_to_backbuffer() is called in next adc interrupt
-            const size_t part_frame_size = adc_frame_end - scope_adc_dma_buffer_right_end;
-            scope_part_out_frame_data_size = sizeof(uint16_t) * part_frame_size;
-            assert(scope_out_frame_data_size > scope_part_out_frame_data_size);
-            memcpy(out_buffer_begin, adc_frame_begin, scope_out_frame_data_size - scope_part_out_frame_data_size);
-            return false;
-        }
-    }
-
-    // we never get here
-    assert(false);
-    scope_part_out_frame_data_size = 0;
-    return true;
-}
-
-static
-const uint16_t* scope_find_trigger_in_sample()
-{
-    //scope_find_trigger_in_sample_active = true;
-
-    const uint16_t* adc_trigger_pointer = 0;
-
-    uint16_t* begin;
-    uint16_t* end;
-
-    // Out adc dma buffer is logically divided in 2 parts,
-    // assign pointers to the half of the buffer that is currently accessible for reading
-
-    if (scope_adc_frame_status == kFrameAcquisitionStatus_LeftHalf)
-    {
-        begin = scope_adc_dma_buffer_left_begin;
-        end = scope_adc_dma_buffer_left_end;
-    }
-    else if (scope_adc_frame_status == kFrameAcquisitionStatus_RightHalf)
-    {
-        begin = scope_adc_dma_buffer_right_begin;
-        end = scope_adc_dma_buffer_right_end;
-    }
-    else
+    // Make sure that transmission is finished first
+    if (scope_out_data_tx_status == kOutDataTxStatus_InProgress)
     {
         assert(false);
+        return;
     }
 
+    // Swap buffers.
+    uint8_t* tmp = scope_out_frame_front_buffer;
+    scope_out_frame_front_buffer = scope_out_frame_back_buffer;
+    scope_out_frame_back_buffer = tmp;
+
+    assert (scope_out_frame_front_buffer != scope_out_frame_back_buffer);
+}
+
+static
+void scope_copy_frame_to_backbuffer(const uint16_t* adc_frame_begin)
+{
+    uint8_t* const out_buffer_begin = scope_out_frame_back_buffer + SCOPE_OUT_FRAME_HEADER_SIZE;
+    memcpy(out_buffer_begin, adc_frame_begin, scope_out_frame_data_size);
+}
+
+
+static
+const uint16_t* scope_find_trigger()
+{
+    const uint16_t* adc_trigger_pointer = 0;
+
+    uint16_t* begin = scope_record_buffer + scope_adc_frame_size * SCOPE_MARGIN_FRAME_COUNT;
+    uint16_t trigger_search_range = (SCOPE_RECORD_BUFFER_FRAME_COUNT - 2 * SCOPE_MARGIN_FRAME_COUNT) * scope_adc_frame_size;
+    uint16_t* end = begin + trigger_search_range;
+    //uint16_t* end = scope_record_buffer + (SCOPE_RECORD_BUFFER_FRAME_COUNT - 2) * scope_adc_frame_size * SCOPE_ADC_FRAMES_IN_HALF_BUFFER;
 
     // Auto find trigger - use mean signal value as trigger value
 
@@ -549,106 +457,21 @@ const uint16_t* scope_find_trigger_in_sample()
 }
 
 /**
- * Return a pointer to left or right part of ADC buffer, depending on the adc status enum.
+ * Return a pointer to left or right part of ADC buffer, depending on the ADCBufferStatus.
  */
 static
-uint16_t* scope_adc_dma_buffer_begin()
+uint16_t* scope_adc_dma_buffer_begin(enum ADCBufferStatus adc_acquisition_status)
 {
-    switch (scope_adc_frame_status)
+    switch (adc_acquisition_status)
     {
-    case kFrameAcquisitionStatus_LeftHalf:
+    case kADCBufferStatus_LeftHalf:
         return scope_adc_dma_buffer_left_begin;
-    case kFrameAcquisitionStatus_RightHalf:
+    case kADCBufferStatus_RightHalf:
         return scope_adc_dma_buffer_right_begin;
-    case kFrameAcquisitionStatus_Completed:
-        assert(false);
     default:
         assert(false);
         return scope_adc_dma_buffer_left_begin;
     };
-}
-
-/**
- * Copies adc frame to back-buffer.
- * If adc frames spans over the adc buffer halves, the frame is copied in 2 steps,
- * where other part of the frame is copied during second call to this method.
- * Swaps back-buffer with front-buffer when copy is completed
- * front-buffer is then ready to be transmitted.
- * This method should be called in ADC ConvCpltCallback and ADC ConvHalfCpltCallback.
- * The adcDataStatus enum tells which part of the ADC buffer is ready (left or right).
- * The scope_adc_frame_status is then set to this value and changed to kFrameAcquisitionStatus_Completed only after
- * adc frame is fully copied.
- */
-static
-void scope_on_adc_data_ready(enum FrameAcquisitionStatus adcDataStatus)
-{
-    // Scope_adc_data_status_once is to detect the situation where
-    // buffer is filled for the first time and we may not have the data in the right buffer yet.
-    // scope_adc_frame_status_once is then kFrameAcquisitionStatus_LeftHalf.
-    // Once the right buffer is filled it changes to kFrameAcquisitionStatus_RightHalf.
-    if (scope_adc_frame_status_once == kFrameAcquisitionStatus_Idle)
-    {
-        scope_adc_frame_status_once = adcDataStatus;
-    }
-
-    if (scope_adc_frame_status == kFrameAcquisitionStatus_Completed ||
-        scope_adc_frame_status == kFrameAcquisitionStatus_Idle)
-    {
-        // Previous copy operation was completed or this is the first copy.
-        // We find trigger position in the ADC buffer, this will mark the start of ADC frame to copy.
-        // In trigger 'none' mode, frame always starts at the beginning of the ADC buffer.
-        scope_adc_frame_status = adcDataStatus;
-        const uint16_t* adcFramePointer = 0;
-        if (scope_trigger_type == kScopeTrigger_Auto)
-        {
-           adcFramePointer = scope_find_trigger_in_sample();
-        }
-        if (adcFramePointer == 0)
-        {
-            // In trigger 'none' mode or if trigger was not found, just point to start of the buffer
-            adcFramePointer = scope_adc_dma_buffer_begin();
-        }
-        assert (adcFramePointer != 0);
-        if (adcFramePointer != 0)
-        {
-            const bool complete_frame_copied = scope_copy_frame_to_backbuffer(adcFramePointer);
-            if (complete_frame_copied)
-            {
-                scope_swap_out_buffers();
-            }
-            else
-            {
-                // Step 1 of partial frame copy is completed.
-                // There is still a missing part of frame to be copied.
-                // It will be copied on the next adc interrupt, next time on_adc_data_ready() is called
-            }
-        }
-    }
-    else if (scope_adc_frame_status != adcDataStatus)
-    {
-        assert(adcDataStatus == kFrameAcquisitionStatus_LeftHalf || adcDataStatus == kFrameAcquisitionStatus_RightHalf);
-        assert(scope_trigger_type == kScopeTrigger_Auto);
-
-        // Step 2 of partial frame copy in trigger mode.
-        // Only called in trigger mode
-        scope_adc_frame_status = adcDataStatus;
-        const bool complete_frame_copied = scope_copy_frame_to_backbuffer(scope_adc_dma_buffer_begin());
-        if (complete_frame_copied)
-        {
-            scope_swap_out_buffers();
-        }
-        else
-        {
-            // The second copy finishes the job, should always be successful.
-            assert(false);
-        }
-    }
-    else
-    {
-        // Called twice with the same scope_adc_frame_status.
-        // We must have skipped other part of buffer.
-        assert(false);
-    }
 }
 
 void scope_process_requested_commands()
@@ -671,12 +494,59 @@ void scope_process_requested_commands()
     }
 }
 
+static
+void scope_on_adc_data_ready(enum ADCBufferStatus adc_acquisition_status)
+{
+    if (scope_recording_status == kRecordingStatus_Completed)
+    {
+        // Nothing to do, data already in buffer and reader didn't have a chance to read it yet.
+        // Reader will reset scope_recording_status to kRecordingStatus_Idle after it reads the data.
+        return;
+    }
+
+    if (scope_recording_status == kRecordingStatus_Idle)
+    {
+        // Start recording
+        scope_recording_status = kRecordingStatus_InProgress;
+        assert(scope_record_counter == 0);
+        scope_record_counter = 0;
+    }
+    else if (scope_recording_status == kRecordingStatus_InProgress)
+    {
+        assert(scope_record_counter > 0);
+    }
+    else
+    {
+        assert(false);
+    }
+
+    // Append next ADC data frame (s) to record buffer
+
+    uint16_t* src = scope_adc_dma_buffer_begin(adc_acquisition_status);
+    const uint16_t next_frame_pos = scope_record_counter * scope_adc_frame_size * SCOPE_ADC_FRAMES_IN_HALF_BUFFER;
+    uint16_t* dest = scope_record_buffer + scope_adc_frame_size * SCOPE_MARGIN_FRAME_COUNT + next_frame_pos;
+
+    assert(dest + scope_adc_frame_size * SCOPE_MARGIN_FRAME_COUNT <= scope_record_buffer + SCOPE_RECORD_BUFFER_MAX_SIZE);
+
+    memcpy(dest, src, scope_adc_frame_size_bytes * SCOPE_ADC_FRAMES_IN_HALF_BUFFER);
+
+
+    scope_record_counter++;
+    const int record_counter_max = SCOPE_RECORD_BUFFER_FRAME_COUNT / SCOPE_ADC_FRAMES_IN_HALF_BUFFER;
+
+    if (scope_record_counter >= record_counter_max)
+    {
+        scope_record_counter = 0;
+        scope_recording_status = kRecordingStatus_Completed;
+    }
+}
+
 /// Right ADC buffer
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc == &hadc1)
     {
-        scope_on_adc_data_ready(kFrameAcquisitionStatus_RightHalf);
+        scope_on_adc_data_ready(kADCBufferStatus_RightHalf);
     }
 }
 
@@ -685,7 +555,7 @@ void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc == &hadc1)
     {
-        scope_on_adc_data_ready(kFrameAcquisitionStatus_LeftHalf);
+        scope_on_adc_data_ready(kADCBufferStatus_LeftHalf);
     }
 }
 
@@ -712,7 +582,6 @@ void scope_encode_output_frame()
     const uint16_t src_pack_size_samples = 3;
     const uint16_t dest_pack_size_samples = src_pack_size_samples - 1;
     const uint16_t src_pack_size = src_pack_size_samples * SCOPE_ADC_SAMPLE_SIZE;
-    const uint16_t dest_pack_size = dest_pack_size_samples * SCOPE_ADC_SAMPLE_SIZE;
     const uint16_t pack_count = scope_out_frame_data_size / src_pack_size;
     const uint16_t tail_data_size = scope_out_frame_data_size % src_pack_size;
 
@@ -725,11 +594,11 @@ void scope_encode_output_frame()
     scope_out_encoded_frame_buffer_size = SCOPE_OUT_FRAME_HEADER_SIZE + dest_encoded_data_size * SCOPE_ADC_SAMPLE_SIZE + tail_data_size;
 
     // Source range to be encoded
-    const uint16_t* src_begin = scope_out_frame_front_buffer + SCOPE_OUT_FRAME_HEADER_SIZE;
-    const uint16_t* src_end = src_begin + src_encoded_data_size;
+    uint16_t* const src_begin = (uint16_t*)(scope_out_frame_front_buffer + SCOPE_OUT_FRAME_HEADER_SIZE);
+    uint16_t* const src_end = src_begin + src_encoded_data_size;
 
     // Destination range
-    uint16_t* dest = scope_out_encoded_frame_buffer + SCOPE_OUT_FRAME_HEADER_SIZE;
+    uint16_t* dest = (uint16_t*)(scope_out_encoded_frame_buffer + SCOPE_OUT_FRAME_HEADER_SIZE);
     uint16_t* dest_end = dest + dest_encoded_data_size;
 
     // Encode
@@ -799,32 +668,113 @@ void Scope_SetTimeBase(enum TimeBaseCode timeBase)
     scope_requested_new_time_base_code = timeBase;
 }
 
+
 void Scope_TransmitFrame()
 {
-    assert(scope_out_data_tx_status != kOutDataTxStatus_InProgress);
-
-    // Wait for kOutputFrameReadyStatus_Ready unless acquisition is stopped.
-    // Only start transmitting new frame if new complete frame is available in the frame output buffer
-    // While waiting for frame, we can run all requested commands that must be executed only between frames.
-    // If acquisition is stopped, don't wait, continuously transmit last frame.
-    do
+    //
+    // 1. Wait until recording is finished
+    //
+    for(;;)
     {
         scope_process_requested_commands();
         if (scope_run_state == kRunState_Stopped)
         {
             break;
         }
-    } while(scope_out_frame_ready_status != kOutputFrameReadyStatus_Ready);
 
-    // Disable output buffer swap.
-    // Buffer swap will be re-enabled when transmission is finished.
-    scope_out_data_tx_status = kOutDataTxStatus_InProgress;
+        //
+        // 2. Wait until buffer is unlocked and lock the buffer.
+        //
 
-    // Reset the OutputFrameReadyStatus,
-    // Next call to scope_swap_out_buffers() will set the status to kOutputFrameReadyStatus_Ready.
-    scope_out_frame_ready_status = kOutputFrameReadyStatus_Waiting;
 
+        if (scope_recording_status == kRecordingStatus_Completed)
+        {
+            break;
+        }
+    }
+
+
+    //
+    // 4. Find trigger position in buffer
+    //
+
+    // Use Update acquisition parameters.
+    scope_edge_type = scope_requested_edge_type;
+    scope_trigger_type = scope_requested_trigger_type;
+
+    const uint16_t* adcFramePointer = 0;
+    if (scope_trigger_type == kScopeTrigger_Auto)
+    {
+       adcFramePointer = scope_find_trigger();
+    }
+
+    if (adcFramePointer == 0)
+    {
+        // TODO: this is doubled code
+        uint16_t* begin = scope_record_buffer + scope_adc_frame_size * SCOPE_MARGIN_FRAME_COUNT;
+        uint16_t trigger_search_range = (SCOPE_RECORD_BUFFER_FRAME_COUNT - 2 * SCOPE_MARGIN_FRAME_COUNT) * scope_adc_frame_size;
+        uint16_t* end = begin + trigger_search_range;
+
+        // In trigger 'none' mode or if trigger was not found, just point to start of the buffer
+        adcFramePointer = begin;
+        if (scope_time_base_code == kTimeBase_250ms)
+        {
+            adcFramePointer += no_trigger_offset;
+            if (scope_run_state == kRunState_Running)
+            {
+                no_trigger_offset += 3;
+                if (adcFramePointer >= end)
+                {
+                    no_trigger_offset = 0;
+                }
+            }
+        }
+    }
+
+    assert (adcFramePointer != 0);
+
+
+    //
+    // 5. Copy transport frame to backbuffer
+    //
+
+    if (adcFramePointer != 0)
+    {
+        scope_copy_frame_to_backbuffer(adcFramePointer);
+    }
+
+    //
+    // 6. Unlock record buffer
+    //
+
+    scope_recording_status = kRecordingStatus_Idle;
+
+
+    //
+    // 6. Wait for transport to finish
+    //
+
+    // Wait for the UART DMA to finish the frame transmission (wait for HAL_UART_TxCpltCallback())
     uint32_t tickstart = HAL_GetTick();
+    const uint32_t txTimeout = 1000;
+    while (scope_out_data_tx_status != kOutDataTxStatus_Completed && (HAL_GetTick() - tickstart) < txTimeout);
+    if (scope_out_data_tx_status != kOutDataTxStatus_Completed)
+    {
+        // Timeout occurred.
+        // Force status kOutDataTxStatus_Completed in case of timeout.
+        scope_out_data_tx_status = kOutDataTxStatus_Completed;
+    }
+
+    //
+    // 7. swap output buffers
+    //
+    scope_swap_out_buffers();
+
+
+    //
+    // 8. Encode frame and start transmission
+    //
+    scope_out_data_tx_status = kOutDataTxStatus_InProgress;
 
     // Pack (scope_out_frame_front_buffer, scope_out_frame_buffer_size)
     // to (scope_out_encoded_frame_buffer, scope_out_encoded_frame_buffer_size)
@@ -834,17 +784,6 @@ void Scope_TransmitFrame()
     HAL_StatusTypeDef status = HAL_UART_Transmit_DMA(&hlpuart1, scope_out_encoded_frame_buffer, scope_out_encoded_frame_buffer_size);
 
     UNUSED(status);
-
-    // Wait for the UART DMA to finish the frame transmission (wait for HAL_UART_TxCpltCallback())
-    const uint32_t txTimeout = 1000;
-    while (scope_out_data_tx_status != kOutDataTxStatus_Completed && (HAL_GetTick() - tickstart) < txTimeout);
-
-    if (scope_out_data_tx_status != kOutDataTxStatus_Completed)
-    {
-        // Timeout occurred.
-        // Force status kOutDataTxStatus_Completed in case of timeout.
-        scope_out_data_tx_status = kOutDataTxStatus_Completed;
-    }
 
     // Ensure a small idle time between frames.
     HAL_Delay (1);
