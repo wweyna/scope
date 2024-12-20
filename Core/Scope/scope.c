@@ -35,7 +35,7 @@ extern DMA_HandleTypeDef    hdma_lpuart1_tx;
 
 /// Half of ADC buffer can hold maximum of SCOPE_ADC_FRAMES_IN_HALF_BUFFER frames of maximum size
 /// Increasing this number gives more time for processing in ADC interrupt.
-#define SCOPE_ADC_FRAMES_IN_HALF_BUFFER         (4)
+#define SCOPE_ADC_FRAMES_IN_HALF_BUFFER         (2)
 
 /// Half of ADC DMA buffer size in unit16_t samples
 #define SCOPE_ADC_MAX_DMA_BUFFER_HALF_SIZE      (SCOPE_ADC_MAX_FRAME_SIZE * SCOPE_ADC_FRAMES_IN_HALF_BUFFER)
@@ -52,7 +52,7 @@ extern DMA_HandleTypeDef    hdma_lpuart1_tx;
 
 #define SCOPE_OUT_FRAME_HEADER_SIZE (5)                         // OUTPUT frame header length in bytes
 
-#define SCOPE_OUT_MAX_FRAME_DATA_SIZE   (SCOPE_ADC_MAX_FRAME_SIZE * 2)  // Maximum allowed OUTPUT frame data size in bytes
+#define SCOPE_OUT_MAX_FRAME_DATA_SIZE   (SCOPE_ADC_MAX_FRAME_SIZE * SCOPE_ADC_SAMPLE_SIZE)  // Maximum allowed OUTPUT frame data size in bytes
 #define SCOPE_OUT_MAX_FRAME_SIZE        (SCOPE_OUT_MAX_FRAME_DATA_SIZE + SCOPE_OUT_FRAME_HEADER_SIZE)  // Maximu allowed OUTPUT frame size in bytes (with header)
 #define SCOPE_OUT_MAX_DMA_BUFFER_SIZE    SCOPE_OUT_MAX_FRAME_SIZE  // We send single frame at a time
 
@@ -250,7 +250,9 @@ void scope_setup_frame_header()
 static
 void scope_reset_buffers()
 {
+    assert(SCOPE_ADC_FRAMES_IN_HALF_BUFFER >= 2);
     assert(SCOPE_ADC_FRAMES_IN_HALF_BUFFER % 2 == 0);
+    assert(SCOPE_RECORD_BUFFER_FRAME_COUNT >= 2);
     assert(SCOPE_RECORD_BUFFER_FRAME_COUNT % SCOPE_ADC_FRAMES_IN_HALF_BUFFER == 0);
 
     memset((char*)scope_adc_dma_buffer, 0, SCOPE_ADC_MAX_DMA_BUFFER_SIZE * SCOPE_ADC_SAMPLE_SIZE);
@@ -400,7 +402,7 @@ uint16_t* scope_find_trigger()
 
     uint16_t* data_begin = scope_record_buffer + scope_adc_frame_size * SCOPE_MARGIN_FRAME_COUNT;
     uint16_t* begin = data_begin + scope_get_trigger_offset();
-    uint16_t* end = data_begin + scope_record_buffer_size;
+    uint16_t* end = data_begin + scope_record_buffer_size - scope_get_trigger_offset();
 
     // Auto find trigger - use mean signal value as trigger value
 
@@ -748,7 +750,6 @@ void Scope_TransmitFrame()
             break;
         }
     }
-
 
     //
     // 4. Find trigger position in buffer
