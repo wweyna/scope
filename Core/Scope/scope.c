@@ -35,7 +35,7 @@ extern DMA_HandleTypeDef    hdma_lpuart1_tx;
 
 /// Half of ADC buffer can hold maximum of SCOPE_ADC_FRAMES_IN_HALF_BUFFER frames of maximum size
 /// Increasing this number gives more time for processing in ADC interrupt.
-#define SCOPE_ADC_FRAMES_IN_HALF_BUFFER         (2)
+#define SCOPE_ADC_FRAMES_IN_HALF_BUFFER         (4)
 
 /// Half of ADC DMA buffer size in unit16_t samples
 #define SCOPE_ADC_MAX_DMA_BUFFER_HALF_SIZE      (SCOPE_ADC_MAX_FRAME_SIZE * SCOPE_ADC_FRAMES_IN_HALF_BUFFER)
@@ -63,9 +63,9 @@ extern DMA_HandleTypeDef    hdma_lpuart1_tx;
 
 
 #define SCOPE_MARGIN_FRAME_COUNT         1
-#define SCOPE_RECORD_BUFFER_FRAME_COUNT  (SCOPE_ADC_FRAMES_IN_HALF_BUFFER + SCOPE_MARGIN_FRAME_COUNT * 2)
-#define SCOPE_RECORD_BUFFER_MAX_SIZE     (SCOPE_RECORD_BUFFER_FRAME_COUNT * SCOPE_ADC_MAX_FRAME_SIZE)
-
+#define SCOPE_RECORD_BUFFER_FRAME_COUNT  SCOPE_ADC_FRAMES_IN_HALF_BUFFER * 2
+#define SCOPE_RECORD_BUFFER_MAX_SIZE     ((SCOPE_RECORD_BUFFER_FRAME_COUNT + SCOPE_MARGIN_FRAME_COUNT * 2) * SCOPE_ADC_MAX_FRAME_SIZE)
+#define SCOPE_RECORD_ACQUSITION_COUNT    (SCOPE_RECORD_BUFFER_FRAME_COUNT / SCOPE_ADC_FRAMES_IN_HALF_BUFFER)
 
 // ----------- Types -----------------
 
@@ -139,13 +139,23 @@ enum ScopeCommand
 };
 
 // ----------- Local data  -----------
+uint16_t scope_adc_vdda_voltage;
+
+const uint16_t scope_trigger_position_denominator = 10000;
+const uint16_t scope_trigger_position_50percent = scope_trigger_position_denominator / 2;
+uint16_t scope_trigger_position = scope_trigger_position_50percent;
 
 enum ScopeCommand scope_requested_command = kCmd_None;
-uint16_t scope_adc_vdda_voltage;
-enum TimeBaseCode scope_requested_new_time_base_code;
+enum TimeBaseCode scope_requested_new_time_base_code = kTimeBase_Invalid;
 enum TimeBaseCode scope_time_base_code = SCOPE_DEFAULT_TIME_BASE;
 enum RecordingStatus scope_recording_status = kRecordingStatus_Idle;
-uint16_t no_trigger_offset = 0;
+enum RunState scope_run_state = kRunState_Invalid;
+enum ScopeEdgeType scope_edge_type = kScopeEdge_Rising;
+enum ScopeEdgeType scope_requested_edge_type = kScopeEdge_Rising;
+enum ScopeTriggerType scope_trigger_type = kScopeTrigger_Auto;
+enum ScopeTriggerType scope_requested_trigger_type = kScopeTrigger_Auto;
+enum OutDataTxStatus scope_out_data_tx_status = kOutDataTxStatus_Idle;
+
 
 // ADC DMA ring-buffer.
 // This buffer records a continues stream of ADC samples in real-time.
@@ -179,18 +189,6 @@ uint8_t* scope_out_frame_back_buffer = scope_out_frame_buffer_2;
 uint16_t scope_out_frame_data_size;     // frame size without header
 uint16_t scope_out_frame_buffer_size;   // frame full size
 
-enum RunState scope_run_state = kRunState_Invalid;
-
-enum ScopeEdgeType scope_edge_type = kScopeEdge_Rising;
-enum ScopeEdgeType scope_requested_edge_type = kScopeEdge_Rising;
-
-enum ScopeTriggerType scope_trigger_type = kScopeTrigger_Auto;
-enum ScopeTriggerType scope_requested_trigger_type = kScopeTrigger_Auto;
-
-enum OutDataTxStatus scope_out_data_tx_status = kOutDataTxStatus_Idle;
-
-
-uint16_t scope_default_trigger_value = SCOPE_ADC_MAX_VALUE / 2;
 
 // ------------- local scope functions ---------------
 
@@ -227,7 +225,7 @@ void scope_select_frame_size(int adc_frame_size)
     scope_out_frame_data_size = scope_adc_frame_size_bytes;
     scope_out_frame_buffer_size = scope_out_frame_data_size + SCOPE_OUT_FRAME_HEADER_SIZE;
 
-    scope_record_buffer_size = (SCOPE_RECORD_BUFFER_FRAME_COUNT - 2 * SCOPE_MARGIN_FRAME_COUNT) * scope_adc_frame_size;
+    scope_record_buffer_size = SCOPE_RECORD_BUFFER_FRAME_COUNT * scope_adc_frame_size;
 }
 
 static
@@ -389,12 +387,20 @@ void scope_copy_frame_to_backbuffer(const uint16_t* adc_frame_begin)
 
 
 static
-const uint16_t* scope_find_trigger()
+uint16_t scope_get_trigger_offset()
 {
-    const uint16_t* adc_trigger_pointer = 0;
+    const double offset_factor = scope_trigger_position / (double)scope_trigger_position_denominator;
+    return scope_adc_frame_size * offset_factor;
+}
 
-    uint16_t* begin = scope_record_buffer + scope_adc_frame_size * SCOPE_MARGIN_FRAME_COUNT;
-    uint16_t* end = begin + scope_record_buffer_size;
+static
+uint16_t* scope_find_trigger()
+{
+    uint16_t* adc_trigger_pointer = 0;
+
+    uint16_t* data_begin = scope_record_buffer + scope_adc_frame_size * SCOPE_MARGIN_FRAME_COUNT;
+    uint16_t* begin = data_begin + scope_get_trigger_offset();
+    uint16_t* end = data_begin + scope_record_buffer_size;
 
     // Auto find trigger - use mean signal value as trigger value
 
@@ -410,10 +416,11 @@ const uint16_t* scope_find_trigger()
 
     const uint16_t half_amplitude = (max_value - min_value) >> 1;
     const uint16_t mean_value = min_value + half_amplitude;
-    const uint16_t scope_trigger_value =  + mean_value;
+    const uint16_t scope_trigger_value = mean_value;
 
 
     // Trigger when value change passes thru scope_trigger_value
+
     uint16_t start_value = *begin;
     int trigger_detection_counter = 0;
     const int trigger_detection_range = 3;
@@ -457,11 +464,22 @@ const uint16_t* scope_find_trigger()
     return adc_trigger_pointer;
 }
 
+static
+uint16_t* scope_get_start_of_frame_for_trigger(uint16_t* adc_trigger_pointer)
+{
+    uint16_t* start_of_frame = adc_trigger_pointer - scope_get_trigger_offset();
+    if (start_of_frame < scope_record_buffer)
+    {
+        assert(false);
+        start_of_frame = scope_record_buffer;
+    }
+    return start_of_frame;
+}
 
 static
-const uint16_t* scope_first_frame()
+uint16_t* scope_first_frame()
 {
-    const uint16_t* begin = scope_record_buffer + scope_adc_frame_size * SCOPE_MARGIN_FRAME_COUNT;
+    uint16_t* begin = scope_record_buffer + scope_adc_frame_size * SCOPE_MARGIN_FRAME_COUNT;
     return begin;
 }
 
@@ -539,11 +557,9 @@ void scope_on_adc_data_ready(enum ADCBufferStatus adc_acquisition_status)
 
     memcpy(dest, src, scope_adc_frame_size_bytes * SCOPE_ADC_FRAMES_IN_HALF_BUFFER);
 
-
     scope_record_counter++;
-    const int record_counter_max = SCOPE_RECORD_BUFFER_FRAME_COUNT / SCOPE_ADC_FRAMES_IN_HALF_BUFFER;
 
-    if (scope_record_counter >= record_counter_max)
+    if (scope_record_counter >= SCOPE_RECORD_ACQUSITION_COUNT)
     {
         scope_record_counter = 0;
         scope_recording_status = kRecordingStatus_Completed;
@@ -630,6 +646,37 @@ void scope_encode_output_frame()
     }
 }
 
+uint16_t*
+scope_get_start_of_output_frame()
+{
+    uint16_t* output_frame = 0;
+    if (scope_trigger_type == kScopeTrigger_Auto)
+    {
+       output_frame = scope_find_trigger();
+       if (output_frame)
+       {
+           output_frame = scope_get_start_of_frame_for_trigger(output_frame);
+       }
+    }
+
+    if (output_frame == 0)
+    {
+        // Trigger not found or no trigger mode, just take the frist frame
+        output_frame = scope_first_frame();
+    }
+
+    return output_frame;
+}
+
+static
+void scope_set_trigger_position_x(uint16_t x_position)
+{
+    scope_trigger_position = x_position;
+    if (scope_trigger_position >= scope_trigger_position_denominator)
+    {
+        scope_trigger_position = scope_trigger_position_denominator - 1;
+    }
+}
 
 // -------------------- Scope external API ----------------
 
@@ -711,28 +758,18 @@ void Scope_TransmitFrame()
     scope_edge_type = scope_requested_edge_type;
     scope_trigger_type = scope_requested_trigger_type;
 
-    const uint16_t* adcFramePointer = 0;
-    if (scope_trigger_type == kScopeTrigger_Auto)
-    {
-       adcFramePointer = scope_find_trigger();
-    }
+    const uint16_t* output_frame_source = scope_get_start_of_output_frame();
 
-    if (adcFramePointer == 0)
-    {
-        // Trigger not found or no trigger mode
-        adcFramePointer = scope_first_frame();
-    }
-
-    assert (adcFramePointer != 0);
+    assert (output_frame_source != 0);
 
 
     //
-    // 5. Copy transport frame to backbuffer
+    // 5.Copy output frame from record buffer to output backbuffer
     //
 
-    if (adcFramePointer != 0)
+    if (output_frame_source != 0)
     {
-        scope_copy_frame_to_backbuffer(adcFramePointer);
+        scope_copy_frame_to_backbuffer(output_frame_source);
     }
 
     //
