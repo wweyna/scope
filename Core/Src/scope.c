@@ -163,6 +163,7 @@ uint16_t* scope_adc_dma_buffer_right_begin;
 
 uint16_t scope_record_buffer[SCOPE_RECORD_BUFFER_MAX_SIZE];
 uint16_t scope_record_counter;
+uint16_t scope_record_buffer_size;
 
 // Output frame double-buffer.
 
@@ -225,6 +226,8 @@ void scope_select_frame_size(int adc_frame_size)
 
     scope_out_frame_data_size = scope_adc_frame_size_bytes;
     scope_out_frame_buffer_size = scope_out_frame_data_size + SCOPE_OUT_FRAME_HEADER_SIZE;
+
+    scope_record_buffer_size = (SCOPE_RECORD_BUFFER_FRAME_COUNT - 2 * SCOPE_MARGIN_FRAME_COUNT) * scope_adc_frame_size;
 }
 
 static
@@ -391,9 +394,7 @@ const uint16_t* scope_find_trigger()
     const uint16_t* adc_trigger_pointer = 0;
 
     uint16_t* begin = scope_record_buffer + scope_adc_frame_size * SCOPE_MARGIN_FRAME_COUNT;
-    uint16_t trigger_search_range = (SCOPE_RECORD_BUFFER_FRAME_COUNT - 2 * SCOPE_MARGIN_FRAME_COUNT) * scope_adc_frame_size;
-    uint16_t* end = begin + trigger_search_range;
-    //uint16_t* end = scope_record_buffer + (SCOPE_RECORD_BUFFER_FRAME_COUNT - 2) * scope_adc_frame_size * SCOPE_ADC_FRAMES_IN_HALF_BUFFER;
+    uint16_t* end = begin + scope_record_buffer_size;
 
     // Auto find trigger - use mean signal value as trigger value
 
@@ -454,6 +455,14 @@ const uint16_t* scope_find_trigger()
     }
 
     return adc_trigger_pointer;
+}
+
+
+static
+const uint16_t* scope_first_frame()
+{
+    const uint16_t* begin = scope_record_buffer + scope_adc_frame_size * SCOPE_MARGIN_FRAME_COUNT;
+    return begin;
 }
 
 /**
@@ -710,25 +719,8 @@ void Scope_TransmitFrame()
 
     if (adcFramePointer == 0)
     {
-        // TODO: this is doubled code
-        uint16_t* begin = scope_record_buffer + scope_adc_frame_size * SCOPE_MARGIN_FRAME_COUNT;
-        uint16_t trigger_search_range = (SCOPE_RECORD_BUFFER_FRAME_COUNT - 2 * SCOPE_MARGIN_FRAME_COUNT) * scope_adc_frame_size;
-        uint16_t* end = begin + trigger_search_range;
-
-        // In trigger 'none' mode or if trigger was not found, just point to start of the buffer
-        adcFramePointer = begin;
-        if (scope_time_base_code == kTimeBase_250ms)
-        {
-            adcFramePointer += no_trigger_offset;
-            if (scope_run_state == kRunState_Running)
-            {
-                no_trigger_offset += 3;
-                if (adcFramePointer >= end)
-                {
-                    no_trigger_offset = 0;
-                }
-            }
-        }
+        // Trigger not found or no trigger mode
+        adcFramePointer = scope_first_frame();
     }
 
     assert (adcFramePointer != 0);
