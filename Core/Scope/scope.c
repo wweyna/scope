@@ -603,7 +603,7 @@ void scope_encode_output_frame()
     // ADC data is reduced to 10 bit sample for transport
     // The pack of 3 10bit samples is encoded into 2 samples by encoding 3rd sample into free 5-bit space of first 2 samples
     // (12,12,12) -> (10,10,10) -> (10 + 5, 10 + 5)
-    // The encoded 4 sample pack contains data in first 15 bits.
+    // The encoded 3 sample pack contains data in first 15 bits.
     // Last byte is reserved for special codes (like frame start).
 
     const uint16_t src_pack_size_samples = 3;
@@ -670,15 +670,15 @@ scope_get_start_of_output_frame()
     return output_frame;
 }
 
-static
-void scope_set_trigger_position_x(uint16_t x_position)
-{
-    scope_trigger_position = x_position;
-    if (scope_trigger_position >= scope_trigger_position_denominator)
-    {
-        scope_trigger_position = scope_trigger_position_denominator - 1;
-    }
-}
+//static
+//void scope_set_trigger_position_x(uint16_t x_position)
+//{
+//    scope_trigger_position = x_position;
+//    if (scope_trigger_position >= scope_trigger_position_denominator)
+//    {
+//        scope_trigger_position = scope_trigger_position_denominator - 1;
+//    }
+//}
 
 // -------------------- Scope external API ----------------
 
@@ -729,9 +729,8 @@ void Scope_SetTimeBase(enum TimeBaseCode timeBase)
 
 void Scope_TransmitFrame()
 {
-    //
-    // 1. Wait until recording is finished
-    //
+    // Wait until recording is finished.
+    // Process incoming requests while waiting.
     for(;;)
     {
         scope_process_requested_commands();
@@ -739,52 +738,33 @@ void Scope_TransmitFrame()
         {
             break;
         }
-
-        //
-        // 2. Wait until buffer is unlocked and lock the buffer.
-        //
-
-
         if (scope_recording_status == kRecordingStatus_Completed)
         {
             break;
         }
     }
 
-    //
-    // 4. Find trigger position in buffer
-    //
-
-    // Use Update acquisition parameters.
+    // Update acquisition parameters.
     scope_edge_type = scope_requested_edge_type;
     scope_trigger_type = scope_requested_trigger_type;
 
+    // Find trigger position in buffer
     const uint16_t* output_frame_source = scope_get_start_of_output_frame();
-
     assert (output_frame_source != 0);
 
-
-    //
-    // 5.Copy output frame from record buffer to output backbuffer
-    //
+    // Copy output frame from record buffer to output back-buffer
 
     if (output_frame_source != 0)
     {
         scope_copy_frame_to_backbuffer(output_frame_source);
     }
 
-    //
-    // 6. Unlock record buffer
-    //
+    // Unlock record buffer
 
     scope_recording_status = kRecordingStatus_Idle;
 
-
-    //
-    // 6. Wait for transport to finish
-    //
-
     // Wait for the UART DMA to finish the frame transmission (wait for HAL_UART_TxCpltCallback())
+
     uint32_t tickstart = HAL_GetTick();
     const uint32_t txTimeout = 1000;
     while (scope_out_data_tx_status != kOutDataTxStatus_Completed && (HAL_GetTick() - tickstart) < txTimeout);
@@ -795,20 +775,16 @@ void Scope_TransmitFrame()
         scope_out_data_tx_status = kOutDataTxStatus_Completed;
     }
 
-    //
-    // 7. swap output buffers
-    //
+    // Swap output buffers
+
     scope_swap_out_buffers();
 
+    // Encode frame and start transmission
 
-    //
-    // 8. Encode frame and start transmission
-    //
     scope_out_data_tx_status = kOutDataTxStatus_InProgress;
 
     // Pack (scope_out_frame_front_buffer, scope_out_frame_buffer_size)
     // to (scope_out_encoded_frame_buffer, scope_out_encoded_frame_buffer_size)
-    // Packed output frame is 20% smaller.
     scope_encode_output_frame();
 
     HAL_StatusTypeDef status = HAL_UART_Transmit_DMA(&hlpuart1, scope_out_encoded_frame_buffer, scope_out_encoded_frame_buffer_size);
