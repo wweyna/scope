@@ -148,14 +148,15 @@ uint16_t scope_trigger_position = scope_trigger_position_50percent;
 enum ScopeCommand scope_requested_command = kCmd_None;
 enum TimeBaseCode scope_requested_new_time_base_code = kTimeBase_Invalid;
 enum TimeBaseCode scope_time_base_code = SCOPE_DEFAULT_TIME_BASE;
-enum RecordingStatus scope_recording_status = kRecordingStatus_Idle;
 enum RunState scope_run_state = kRunState_Invalid;
 enum ScopeEdgeType scope_edge_type = kScopeEdge_Rising;
 enum ScopeEdgeType scope_requested_edge_type = kScopeEdge_Rising;
 enum ScopeTriggerType scope_trigger_type = kScopeTrigger_Auto;
 enum ScopeTriggerType scope_requested_trigger_type = kScopeTrigger_Auto;
-enum OutDataTxStatus scope_out_data_tx_status = kOutDataTxStatus_Idle;
 
+// ISR shared globals
+volatile enum OutDataTxStatus scope_out_data_tx_status = kOutDataTxStatus_Idle;
+volatile enum RecordingStatus scope_recording_status = kRecordingStatus_Idle;
 
 // ADC DMA ring-buffer.
 // This buffer records a continues stream of ADC samples in real-time.
@@ -172,8 +173,10 @@ uint16_t* scope_adc_dma_buffer_right_begin;
 // Record buffer
 
 uint16_t scope_record_buffer[SCOPE_RECORD_BUFFER_MAX_SIZE];
-uint16_t scope_record_counter;
 uint16_t scope_record_buffer_size;
+
+// ISR shared global variable
+volatile uint16_t scope_record_counter;
 
 // Output frame double-buffer.
 
@@ -589,7 +592,8 @@ void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 void
 HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
-    scope_out_data_tx_status = kOutDataTxStatus_Completed;
+	if (huart == &hlpuart1)
+		scope_out_data_tx_status = kOutDataTxStatus_Completed;
 }
 
 void scope_encode_output_frame()
