@@ -1,6 +1,7 @@
-# STM32 USB (UART‑over‑USB) Scope — README
+# STM32 USB Scope — README
 
-This project is a minimal “USB oscilloscope” built on an STM32 microcontroller. It samples one analog channel with ADC + DMA, performs simple trigger detection, and streams frames to a Windows host application over a UART (typically exposed to the PC as a USB virtual COM port via an on‑board ST‑Link or external USB–UART bridge).
+This project is a minimal “USB oscilloscope” built on an STM32 microcontroller.
+It samples one analog channel with ADC + DMA, performs simple trigger detection, and streams frames to a Windows host application over a UART exposed to the PC as a USB virtual COM port.
 
 ---
 
@@ -16,7 +17,7 @@ This project is a minimal “USB oscilloscope” built on an STM32 microcontroll
 8. Transmission: The output buffers are swapped so the prepared frame becomes the front buffer. The encoded buffer is sent with LPUART1 using DMA. A transmit complete interrupt marks the transfer status completed.
 9. Concurrency: ADC and DMA continue sampling while the previous frame is being encoded and transmitted, so capture and transmit run in parallel when rates are within limits.
 
----
+
 
 ## Time bases
 
@@ -32,7 +33,7 @@ Three fixed time bases are provided. Each defines the **samples per frame** and 
 
 ---
 
-## Buffers (what they are and how big they get)
+## Buffers
 
 All sizes below are expressed in **samples** unless stated otherwise. One sample = `uint16_t` (2 bytes).
 
@@ -60,10 +61,11 @@ All sizes below are expressed in **samples** unless stated otherwise. One sample
 * **Contents:** `5‑byte header + one frame of raw 16‑bit samples`.
 * **Header (5 bytes):**
 
-  1. `0xFF`
-  2. `0xFE`
-     3–4. VREF (LSB, MSB) measured at startup
-  3. time‑base code (`1`, `2`, `3`)
+  0: `0xFF`
+  1: `0xFE`
+  2-3: VREF (LSB, MSB) measured at startup
+  4: time‑base code (`1`, `2`, `3`)
+
 * **Swap rule:** never swap while a UART DMA transfer is in progress; swapping is performed just before encoding/transmit so the freshly prepared frame becomes the **front**.
 
 ### 4) Encoded transmit buffer
@@ -77,10 +79,8 @@ All sizes below are expressed in **samples** unless stated otherwise. One sample
 ## Triggering and frame selection
 
 * **Edge:** rising or falling.
-* **Modes:**
-
-  * **Auto:** scan the recorded region (excluding margins) for a crossing of the mid‑level between the local min and max. A small multi‑sample confirmation window reduces spurious picks. The start of the frame is then placed at `trigger_position` (default: 50%) *before* the detected crossing.
-  * **None:** use the first frame in the record (immediately after the left margin).
+* **Auto:** scan the recorded region (excluding margins) for a crossing of the mid‑level between the local min and max. A small multi‑sample confirmation window reduces spurious picks. The start of the frame is then placed at `trigger_position` (default: 50%) *before* the detected crossing.
+* **None:** use the first frame in the record (immediately after the left margin).
 
 After selecting the start address, exactly **one frame** is copied from the record buffer into the **output back‑buffer** (after its header).
 
@@ -88,17 +88,7 @@ After selecting the start address, exactly **one frame** is copied from the reco
 
 ## Encoding (3×10‑bit → 2×16‑bit)
 
-To cut bandwidth, each group of three ADC samples is reduced to 10 bits and packed into two 16‑bit words:
-
-* Take `s0`, `s1`, `s2` (12‑bit). Discard two LSBs → `s*_10`.
-* Emit two words:
-
-  * `w0 = s0_10 | ((s2_10 & 0x001F) << 10)`
-  * `w1 = s1_10 | ((s2_10 & 0x03E0) << 5)`
-* **Bit 15 is always 0** to avoid colliding with the header marker pattern.
-* If the frame size isn’t a multiple of three, the **tail** (1–2 samples) is stored as standalone 16‑bit words containing the 10‑bit values.
-
-> **Host decoding sketch:** `s0 = w0 & 0x03FF; s1 = w1 & 0x03FF; s2 = ((w0>>10)&0x1F) | (((w1>>10)&0x1F)<<5);` (optionally `<< 2` to put them back on a 12‑bit scale).
+To cut bandwidth, each group of three ADC samples is reduced to 10 bits and packed into two 16‑bit words.
 
 ---
 
