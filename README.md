@@ -6,21 +6,15 @@ This project is a minimal “USB oscilloscope” built on an STM32 microcontroll
 
 ## High‑level pipeline
 
-```
-ADC1 → DMA (circular, left/right halves)
-          │
-          ├─(IRQ: half/complete)→ Record buffer (4 frames + 1‑frame margins)
-          │                                    │
-          └────────────────────────────────────┘
-                               ▼
-                       Trigger selection
-                               ▼
-                Output back‑buffer (with 5‑byte header)
-                               ▼
-                     3×10‑bit → 2×16‑bit packer
-                               ▼
-                      LPUART1 DMA → Windows app
-```
+1. Sampling: ADC1 runs continuously at a rate determined by the selected time base.
+2. DMA ingress: In circular mode, DMA writes samples into a two‑half ring buffer called the ADC DMA buffer. Each half completion raises an interrupt.
+3. Record assembly: The interrupt handler appends two complete frames from the finished half into the record buffer. The record buffer contains a left margin frame, four active frames, and a right margin frame. After two interrupts the record is marked Completed.
+4. Command handling: While waiting for a Completed record, the main loop applies any pending host commands (run, stop, edge, trigger mode, time base).
+5. Triggering: When a record is ready, the firmware selects the frame start. In Auto mode it scans the active region for a rising or falling crossing at the mid level between the local minimum and maximum, then offsets by the configured trigger position. In None mode it uses the first active frame.
+6. Output preparation: Exactly one frame is copied from the record buffer into the output back buffer after a five byte header. The record buffer status returns to Idle so the next record can begin.
+7. Encoding: The selected frame is packed from three ten bit samples into two sixteen bit words, with the most significant bit kept at zero. Any leftover one or two samples are stored as individual words.
+8. Transmission: The output buffers are swapped so the prepared frame becomes the front buffer. The encoded buffer is sent with LPUART1 using DMA. A transmit complete interrupt marks the transfer status completed.
+9. Concurrency: ADC and DMA continue sampling while the previous frame is being encoded and transmitted, so capture and transmit run in parallel when rates are within limits.
 
 ---
 
