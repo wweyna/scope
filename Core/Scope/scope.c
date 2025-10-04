@@ -610,15 +610,15 @@ void scope_encode_output_frame()
     const uint16_t dest_pack_size_samples = src_pack_size_samples - 1;
     const uint16_t src_pack_size = src_pack_size_samples * SCOPE_ADC_SAMPLE_SIZE;
     const uint16_t pack_count = scope_out_frame_data_size / src_pack_size;
-    const uint16_t tail_data_size = scope_out_frame_data_size % src_pack_size;
+    const uint16_t tail_bytes = scope_out_frame_data_size % src_pack_size;
 
     // The data that will be encoded
     const uint16_t src_encoded_data_size = pack_count * src_pack_size_samples;
-    assert(src_encoded_data_size * SCOPE_ADC_SAMPLE_SIZE  + tail_data_size == scope_out_frame_data_size);
+    assert(src_encoded_data_size * SCOPE_ADC_SAMPLE_SIZE  + tail_bytes == scope_out_frame_data_size);
 
     // The encoded (packed) data.
     const uint16_t dest_encoded_data_size = pack_count * dest_pack_size_samples;
-    scope_out_encoded_frame_buffer_size = SCOPE_OUT_FRAME_HEADER_SIZE + dest_encoded_data_size * SCOPE_ADC_SAMPLE_SIZE + tail_data_size;
+    scope_out_encoded_frame_buffer_size = SCOPE_OUT_FRAME_HEADER_SIZE + dest_encoded_data_size * SCOPE_ADC_SAMPLE_SIZE + tail_bytes;
 
     // Source range to be encoded
     uint16_t* const src_begin = (uint16_t*)(scope_out_frame_front_buffer + SCOPE_OUT_FRAME_HEADER_SIZE);
@@ -642,7 +642,8 @@ void scope_encode_output_frame()
     assert (dest == dest_end);
 
     // Copy tail data (remaining unencoded samples)
-    for (uint16_t* src = src_end; src < src_end + tail_data_size; src++)
+    const uint16_t tail_samples = tail_bytes / SCOPE_ADC_SAMPLE_SIZE;
+    for (uint16_t* src = src_end; src < src_end + tail_samples; src++)
     {
         *dest++ = (*src) >> 2;
     }
