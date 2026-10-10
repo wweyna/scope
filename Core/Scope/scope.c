@@ -777,6 +777,11 @@ void Scope_TransmitFrame()
     {
         // Timeout occurred.
         // Force status kOutDataTxStatus_Completed in case of timeout.
+    	// TODO: This DMA transmission timeout handling needs fixing
+    	// Do not mark transmission as completed on timeout.
+    	// DMA may still be reading scope_out_encoded_frame_buffer.
+    	// Safely abort the transmission before reusing the buffer.
+    	// Also check HAL_UART_Transmit_DMA() return status.
         scope_out_data_tx_status = kOutDataTxStatus_Completed;
     }
 
